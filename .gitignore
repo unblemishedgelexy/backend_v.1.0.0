@@ -17,3 +17,5 @@ db.sqlite3
 # OS
 .DS_Store
 Thumbs.db
+
+app/common/bin/ffmpeg.exe
