@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+print("EMAIL_BACKEND LOADED:", os.getenv("EMAIL_BACKEND"))
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -33,6 +35,10 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt",
     'corsheaders',
     'accounts',
+    'chat',
+    'common',
+    'django_rq',
+    'django_celery_results',
 ]
 
 MIDDLEWARE = [
@@ -67,11 +73,42 @@ TEMPLATES = [
 WSGI_APPLICATION = 'auth_project.wsgi.application'
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    "default": {
+        "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.postgresql"),
+        "NAME": os.getenv("DB_NAME"),
+        "USER": os.getenv("DB_USER"),
+        "PASSWORD": os.getenv("DB_PASSWORD"),
+        "HOST": os.getenv("DB_HOST", "localhost"),
+        "PORT": os.getenv("DB_PORT", "5432"),
     }
 }
+
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": os.getenv("REDIS_URL"),
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        }
+    }
+}
+
+REDIS_URL = os.getenv("REDIS_URL")
+
+RQ_QUEUES = {
+    "default": {
+        "URL": REDIS_URL,
+        "DEFAULT_TIMEOUT": 300,
+    }
+}
+
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "rpc://")
+
+CELERY_ACCEPT_CONTENT = ["json"] 
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = "UTC"
 
 AUTH_PASSWORD_VALIDATORS = []
 

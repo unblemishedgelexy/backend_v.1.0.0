@@ -3,10 +3,7 @@ from django.contrib.auth import authenticate, login, logout
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth import get_user_model
-from django.utils import timezone
 import json
-import random
-from .forms import RegistrationForm, LoginForm
 from .models import OTP
 from .utils import send_otp
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer, TokenVerifySerializer
@@ -16,6 +13,10 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.core.paginator import Paginator
+from common.otp_service import verify_otp
+from accounts.tasks import send_registration_otp_email
+from common.redis_service import rate_limit, increment_counter
+
 
 User = get_user_model()
 
@@ -88,186 +89,97 @@ def home_view(request):
             }
         })
 
-
 @csrf_exempt
-@require_http_methods(["POST"])
 def send_registration_otp(request):
-    """Send OTP for email verification during registration"""
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
-    
-    # Debug: see exact structure coming from frontend
-    print("RAW DATA:", data)
+    data = json.loads(request.body)
 
-    raw_email = data.get('email')
-    raw_mobile = data.get('mobile_number')
-    raw_medium = data.get('medium', 'both')
+    email = data.get("email")
+    username = data.get("username")
+    mobile = data.get("mobile_number")
 
-    # If email itself is a dict, unwrap it
-    if isinstance(raw_email, dict):
-        email = raw_email.get('email')
-        mobile_number = raw_email.get('mobile_number') or raw_mobile
-        medium = raw_email.get('medium', raw_medium)
-    else:
-        email = raw_email
-        mobile_number = raw_mobile
-        medium = raw_medium
+    if not all([email, username, mobile]):
+        return JsonResponse(
+            {"success": False, "error": "email, username, mobile required"},
+            status=400
+        )
 
-    print("PARSED:", email, mobile_number, medium)
+    # 🔒 Rate limit per email
+    if not rate_limit(f"rate:otp:{email}", limit=5, window=3600):
+        return JsonResponse(
+            {"success": False, "error": "Too many OTP requests"},
+            status=429
+        )
 
-    if not email:
-        return JsonResponse({
-            'success': False,
-            'error': 'Email is required'
-        }, status=400)
-    
-    # Check if user already exists
-    if User.objects.filter(email=email).exists():
-        return JsonResponse({
-            'success': False,
-            'error': 'Email already registered'
-        }, status=400)
-    
-    if mobile_number and len(mobile_number.strip()) == 0:
-        mobile_number = None    
+    # 🔒 Rate limit per IP
+    ip = request.META.get("REMOTE_ADDR")
+    if not rate_limit(f"rate:otp:ip:{ip}", limit=20, window=3600):
+        return JsonResponse(
+            {"success": False, "error": "Too many requests"},
+            status=429
+        )
 
-    if mobile_number and mobile_number.startswith('+'):
-        mobile_number = mobile_number[1:]
+    if User.objects.filter(username=username).exists():
+        return JsonResponse({"success": False, "error": "Username already taken"}, status=400)
 
-    if mobile_number and mobile_number.startswith('0'):
-        mobile_number = mobile_number[1:]
+    if User.objects.filter(mobile_number=mobile).exists():
+        return JsonResponse({"success": False, "error": "Mobile already registered"}, status=400)
 
-    if mobile_number and not mobile_number.isdigit():
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid mobile number format'
-        }, status=400)
-    
-    if mobile_number and len(mobile_number) < 7:
-        return JsonResponse({
-            'success': False,
-            'error': 'Mobile number too short'
-        }, status=400)
-    
-    if mobile_number and len(mobile_number) > 15:
-        return JsonResponse({
-            'success': False,
-            'error': 'Mobile number too long'
-        }, status=400)
-    
-    if mobile_number and User.objects.filter(mobile_number=mobile_number).exists():
-        return JsonResponse({
-            'success': False,
-            'error': 'Mobile number already registered'
-        }, status=400)
-    
-    # Create temporary user (inactive) for OTP verification
-    temp_username = f"temp_{email.split('@')[0]}_{random.randint(1000, 9999)}"
-    temp_user, created = User.objects.get_or_create(
+    user, created = User.objects.get_or_create(
         email=email,
         defaults={
-            'username': temp_username,
-            'mobile_number': mobile_number or '',
-            'is_active': False  # Inactive until verified
+            "username": username,
+            "mobile_number": mobile,
+            "is_active": False,
         }
     )
-    
-    # Send OTP
-    otp, results = send_otp(temp_user, 'email', medium=medium)
-    
-    return JsonResponse({
-        'success': True,
-        'message': 'OTP sent successfully',
-        'otp_id': otp.id,
-        'results': results,
-        'temporary_user_id': temp_user.id
-    }, status=200)
+
+    if not created and user.is_active:
+        return JsonResponse({"success": False, "error": "Email already registered"}, status=400)
+
+    # 🔥 OTP generation + TTL happens INSIDE WORKER
+    send_registration_otp_email.delay(email)
+
+
+    return JsonResponse({"success": True, "message": "OTP sent"})
 
 @csrf_exempt
-@require_http_methods(["POST"])
 def verify_registration_otp(request):
-    """Verify OTP and complete registration"""
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    data = json.loads(request.body)
 
-    print("RAW DATA:", data)
+    email = data.get("email")
+    otp = data.get("otp")
+    password = data.get("password")
 
-    # unwrap if wrapped in "email"
-    if isinstance(data.get('email'), dict):
-        data = data['email']
-
-    otp_code = data.get('otp_code')
-    username = data.get('username')
-    password = data.get('password')
-    full_name = data.get('full_name', '')
-
-    # 🔐 minimal required fields
-    if not all([otp_code, username, password]):
+    if not all([email, otp, password]):
         return JsonResponse(
-            {'success': False, 'error': 'Missing required fields'},
+            {"success": False, "error": "email, otp, password required"},
             status=400
         )
 
-    # 🔍 find OTP + temp user in one go
-    try:
-        otp = OTP.objects.select_related('user').get(
-            otp_code=otp_code,
-            verification_type='email',
-            is_verified=False,
-        )
-        temp_user = otp.user
-
-        if temp_user.is_active:
-            return JsonResponse(
-                {'success': False, 'error': 'User already activated'},
-                status=400
-            )
-
-        if otp.is_expired():
-            return JsonResponse(
-                {'success': False, 'error': 'OTP has expired'},
-                status=400
-            )
-
-    except OTP.DoesNotExist:
+    # 🔒 OTP attempt limit
+    allowed, _ = increment_counter(f"otp:attempt:{email}", limit=5)
+    if not allowed:
         return JsonResponse(
-            {'success': False, 'error': 'Invalid OTP'},
-            status=400
+            {"success": False, "error": "Too many wrong attempts"},
+            status=429
         )
 
-    print("OTP verified for temp user:", temp_user)
+    # ✅ CORRECT KEY USAGE
+    ok, msg = verify_otp(f"otp:register:{email}", otp)
+    if not ok:
+        return JsonResponse({"success": False, "error": msg}, status=400)
 
-    # ✅ Activate user
-    temp_user.username = username
-    temp_user.set_password(password)
-    temp_user.full_name = full_name
-    temp_user.is_active = True
-    temp_user.is_email_verified = True
-    temp_user.save()
+    user = User.objects.get(email=email)
 
-    otp.is_verified = True
-    otp.save()
-
-    # 🔑 Log user in
-    login(request, temp_user, backend='django.contrib.auth.backends.ModelBackend')
-
-    # 🎫 Generate JWT
-    refresh = RefreshToken.for_user(temp_user)
-    access = CustomAccessToken.for_user(temp_user)
+    user.set_password(password)
+    user.is_active = True
+    user.is_email_verified = True
+    user.save()
 
     return JsonResponse({
-        'success': True,
-        'message': 'Registration successful and email verified',
-        'tokens': {
-            'access': str(access),
-            'refresh': str(refresh),
-        }
-    }, status=201)
-
+        "success": True,
+        "message": "Account created successfully"
+    })
 
 @csrf_exempt
 @require_http_methods(["POST"])
@@ -295,7 +207,7 @@ def login_view(request):
         # Issue JWT tokens on login (using custom token with username)
         refresh = RefreshToken.for_user(user)
         access = CustomAccessToken.for_user(user)
-        tokens = {'access': str(access), 'refresh': str(refresh)}
+        tokens = {'accessToken': str(access), 'refreshToken': str(refresh)}
         return JsonResponse({
             'success': True,
             'message': 'Login successful',
@@ -306,6 +218,78 @@ def login_view(request):
             'success': False,
             'error': 'Invalid username/email/mobile or password'
         }, status=401)
+
+
+@api_view(["PUT"])
+@permission_classes([IsAuthenticated])
+def update_profile(request):
+    user = request.user
+    data = request.data
+
+    # username change limit (3/day)
+    from common.redis_service import increment_counter
+    if "username" in data:
+        key = f"username_change:{user.id}"
+        if not increment_counter(key, 3):
+            return Response({"error": "username change limit reached"}, status=429)
+
+        if User.objects.filter(username=data["username"]).exists():
+            return Response({"error": "username taken"}, status=400)
+
+        user.username = data["username"]
+
+    if "full_name" in data:
+        user.full_name = data["full_name"]
+
+    user.save()
+    return Response({"success": True})
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def add_mobile(request):
+    mobile = request.data.get("mobile_number")
+    user = request.user
+
+    user.mobile_number = mobile
+    user.is_mobile_verified = False
+    user.save()
+
+    from accounts.redis_otp import send_otp_redis
+    otp = send_otp_redis(user.id, "mobile")
+    send_otp(user, "sms", otp)
+
+    return Response({"success": True, "message": "OTP sent"})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def verify_mobile(request):
+    otp = request.data.get("otp")
+    user = request.user
+
+    from accounts.redis_otp import verify_otp_redis
+    if not verify_otp_redis(user.id, "mobile", otp):
+        return Response({"error": "invalid otp"}, status=400)
+
+    user.is_mobile_verified = True
+    user.save()
+    return Response({"success": True})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def upload_profile_picture(request):
+    image = request.FILES.get("image")
+    user = request.user
+
+    from common.imagekit_service import upload_image
+    url = upload_image(image, folder="profiles")
+
+    user.profile_image = url
+    user.save()
+
+    return Response({"success": True, "url": url})
+
 
 
 @api_view(['GET'])
@@ -341,169 +325,191 @@ def users_list(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def password_reset_request(request):
-    """Request password reset - send OTP"""
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
-    
-    email = data.get('email')
-    mobile_number = data.get('mobile_number')
-    medium = data.get('medium', 'both')  # 'email', 'sms', or 'both'
-    
-    if not email and not mobile_number:
-        return JsonResponse({
-            'success': False,
-            'error': 'Email or mobile number is required'
-        }, status=400)
-    
-    # Find user
-    try:
-        if email:
-            user = User.objects.get(email=email)
-        else:
-            user = User.objects.get(mobile_number=mobile_number)
-    except User.DoesNotExist:
-        # Don't reveal if user exists or not
-        return JsonResponse({
-            'success': True,
-            'message': 'If account exists, OTP will be sent'
-        }, status=200)
-    
-    # Send OTP
-    otp, results = send_otp(user, 'password_reset', medium=medium)
-    
-    return JsonResponse({
-        'success': True,
-        'message': 'OTP sent for password reset',
-        'otp_id': otp.id,
-        'results': results,
-        'user_id': user.id
-    }, status=200)
+    data = json.loads(request.body)
+    email = data.get("email")
 
+    if not email:
+        return JsonResponse({"success": False, "error": "email required"}, status=400)
+
+    # rate limit (5 req / 10 min)
+    from common.redis_service import rate_limit
+    key = f"rate:password_reset:{email}"
+    if not rate_limit(key, limit=5, window=600):
+        return JsonResponse(
+            {"success": False, "error": "Too many requests, try later"},
+            status=429
+        )
+
+    user = User.objects.filter(email=email).first()
+    if not user:
+        # security: same response
+        return JsonResponse({"success": True, "message": "If account exists, OTP sent"})
+
+    from accounts.redis_otp import send_otp_redis
+    otp = send_otp_redis(user.id, "password_reset")
+
+    send_otp(user, "password_reset", otp)  # email/sms util
+
+    return JsonResponse({
+        "success": True,
+        "message": "OTP sent for password reset"
+    })
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def password_reset_verify(request):
-    """Verify OTP for password reset"""
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
-    
-    user_id = data.get('user_id')
-    otp_code = data.get('otp_code')
-    
-    if not user_id or not otp_code:
-        return JsonResponse({
-            'success': False,
-            'error': 'User ID and OTP are required'
-        }, status=400)
-    
-    try:
-        user = User.objects.get(id=user_id)
-    except User.DoesNotExist:
-        return JsonResponse({
-            'success': False,
-            'error': 'User not found'
-        }, status=400)
-    
-    # Verify OTP
-    try:
-        otp = OTP.objects.get(user=user, otp_code=otp_code, verification_type='password_reset')
-        
-        if otp.is_expired():
-            return JsonResponse({
-                'success': False,
-                'error': 'OTP has expired'
-            }, status=400)
-        
-        if otp.is_verified:
-            return JsonResponse({
-                'success': False,
-                'error': 'OTP already used'
-            }, status=400)
-    except OTP.DoesNotExist:
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid OTP'
-        }, status=400)
-    
-    # Mark OTP as verified (but don't delete it yet)
-    otp.is_verified = True
-    otp.save()
-    
-    return JsonResponse({
-        'success': True,
-        'message': 'OTP verified successfully',
-        'reset_token': f"{user.id}_{otp.id}"  # Simple token for next step
-    }, status=200)
+    data = json.loads(request.body)
+    email = data.get("email")
+    otp = data.get("otp")
 
+    if not email or not otp:
+        return JsonResponse(
+            {"success": False, "error": "email & otp required"},
+            status=400
+        )
+
+    user = User.objects.filter(email=email).first()
+    if not user:
+        return JsonResponse({"success": False, "error": "Invalid OTP"}, status=400)
+
+    from accounts.redis_otp import verify_otp_redis
+    if not verify_otp_redis(user.id, "password_reset", otp):
+        return JsonResponse({"success": False, "error": "Invalid or expired OTP"}, status=400)
+
+    # generate reset token
+    import secrets
+    reset_token = secrets.token_urlsafe(32)
+
+    from common.redis_service import set_otp
+    set_otp(f"reset_token:{user.id}", reset_token, ttl=600)  # 10 min
+
+    return JsonResponse({
+        "success": True,
+        "reset_token": reset_token
+    })
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def password_reset_confirm(request):
-    """Confirm password reset with new password"""
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
-    
-    user_id = data.get('user_id')
-    otp_id = data.get('otp_id')
-    new_password = data.get('new_password')
-    confirm_password = data.get('confirm_password')
-    
-    if not all([user_id, otp_id, new_password, confirm_password]):
-        return JsonResponse({
-            'success': False,
-            'error': 'All fields are required'
-        }, status=400)
-    
-    if new_password != confirm_password:
-        return JsonResponse({
-            'success': False,
-            'error': 'Passwords do not match'
-        }, status=400)
-    
+    data = json.loads(request.body)
+    email = data.get("email")
+    reset_token = data.get("reset_token")
+    new_password = data.get("new_password")
+
+    if not all([email, reset_token, new_password]):
+        return JsonResponse(
+            {"success": False, "error": "All fields required"},
+            status=400
+        )
+
     if len(new_password) < 8:
-        return JsonResponse({
-            'success': False,
-            'error': 'Password must be at least 8 characters'
-        }, status=400)
-    
-    try:
-        user = User.objects.get(id=user_id)
-        otp = OTP.objects.get(id=otp_id, user=user, verification_type='password_reset')
-        
-        if not otp.is_verified:
-            return JsonResponse({
-                'success': False,
-                'error': 'OTP not verified'
-            }, status=400)
-        
-        if otp.is_expired():
-            return JsonResponse({
-                'success': False,
-                'error': 'OTP has expired'
-            }, status=400)
-    except (User.DoesNotExist, OTP.DoesNotExist):
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid request'
-        }, status=400)
-    
-    # Set new password
+        return JsonResponse(
+            {"success": False, "error": "Password too short"},
+            status=400
+        )
+
+    user = User.objects.filter(email=email).first()
+    if not user:
+        return JsonResponse({"success": False, "error": "Invalid token"}, status=400)
+
+    from common.redis_service import get_otp, delete_otp
+    stored_token = get_otp(f"reset_token:{user.id}")
+
+    if not stored_token or stored_token != reset_token:
+        return JsonResponse(
+            {"success": False, "error": "Invalid or expired reset token"},
+            status=400
+        )
+
+    # set new password
     user.set_password(new_password)
     user.save()
-    
-    # Delete OTP after use
-    otp.delete()
-    
+
+    # cleanup
+    delete_otp(f"reset_token:{user.id}")
+
     return JsonResponse({
-        'success': True,
-        'message': 'Password reset successful. You can now login with your new password.'
-    }, status=200)
+        "success": True,
+        "message": "Password reset successful"
+    })
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def change_email(request):
+    new_email = request.data.get("email")
+    user = request.user
+
+    if not new_email:
+        return Response({"error": "email required"}, status=400)
+
+    if User.objects.filter(email=new_email).exists():
+        return Response({"error": "email already used"}, status=400)
+
+    from accounts.redis_otp import send_otp_redis
+    otp = send_otp_redis(user.id, "email_change")
+
+    send_otp(user, "email", otp, to=new_email)
+
+    # temp store email in redis
+    from common.redis_service import set_otp
+    set_otp(f"pending_email:{user.id}", new_email, 600)
+
+    return Response({"success": True, "message": "OTP sent to new email"})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def verify_email_change(request):
+    otp = request.data.get("otp")
+    user = request.user
+
+    from accounts.redis_otp import verify_otp_redis
+    if not verify_otp_redis(user.id, "email_change", otp):
+        return Response({"error": "Invalid OTP"}, status=400)
+
+    from common.redis_service import get_otp, delete_otp
+    new_email = get_otp(f"pending_email:{user.id}")
+
+    if not new_email:
+        return Response({"error": "Email expired"}, status=400)
+
+    user.email = new_email
+    user.is_email_verified = True
+    user.save()
+
+    delete_otp(f"pending_email:{user.id}")
+
+    return Response({"success": True})
+
+@api_view(["GET"])
+def check_username(request):
+    username = request.GET.get("username")
+    if not username:
+        return Response({"error": "username required"}, status=400)
+
+    exists = User.objects.filter(username=username).exists()
+    return Response({"available": not exists})
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def deactivate_account(request):
+    user = request.user
+    user.is_active = False
+    user.save()
+    return Response({"success": True, "message": "Account deactivated"})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def security_info(request):
+    user = request.user
+    return Response({
+        "email_verified": user.is_email_verified,
+        "mobile_verified": user.is_mobile_verified,
+        "last_login": user.last_login,
+        "role": user.role,
+    })
+
 
 
 @csrf_exempt
